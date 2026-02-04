@@ -509,7 +509,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
             }
             return status;
         } else {
-            NIXL_INFO << \"Finished register memory on rail \" << rail_idx << \" with length \" << length << \" on gpu id \" << gpu_id;
+            NIXL_INFO << "Finished register memory on rail " << rail_idx << " with length " << length << " on gpu id " << gpu_id;
         }
 
         mr_list_out[rail_idx] = mr;
@@ -518,7 +518,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
         // Mark rail as active for progress tracking optimization
         markRailActive(rail_idx);
 
-        NIXL_INFO << \"Registered memory on rail \" << rail_idx
+        NIXL_INFO << "Registered memory on rail " << rail_idx
                    << " (mr=" << static_cast<const void *>(mr) << ", key=" << key << ")";
     }
 
