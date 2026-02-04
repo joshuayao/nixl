@@ -50,8 +50,43 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
 
     std::string selected_provider_name = topology->getProviderName();
 
-    NIXL_DEBUG << "Got " << all_devices.size()
-               << " network devices from topology for provider=" << selected_provider_name;
+    NIXL_INFO << "Got " << all_devices.size()
+              << " network devices from topology for provider: " << selected_provider_name;
+
+    // Check for environment variable to filter devices (e.g., NIXL_DEVICES="mlx5_0,mlx5_2")
+    const char *filter_env = getenv("NIXL_DEVICES");
+    if (filter_env) {
+        std::string filter_str(filter_env);
+        std::vector<std::string> filtered_devices;
+
+        // Parse comma-separated device list
+        size_t pos = 0;
+        while ((pos = filter_str.find(',')) != std::string::npos) {
+            std::string device = filter_str.substr(0, pos);
+            // Check if device exists in all_devices
+            if (std::find(all_devices.begin(), all_devices.end(), device) != all_devices.end()) {
+                filtered_devices.push_back(device);
+            }
+            filter_str.erase(0, pos + 1);
+        }
+        // Handle last device (or only device if no comma)
+        if (!filter_str.empty()) {
+            if (std::find(all_devices.begin(), all_devices.end(), filter_str) != all_devices.end()) {
+                filtered_devices.push_back(filter_str);
+            }
+        }
+
+        if (!filtered_devices.empty()) {
+            NIXL_INFO << "NIXL_DEVICES filter: using " << filtered_devices.size()
+                      << " devices instead of " << all_devices.size();
+            for (const auto& dev : filtered_devices) {
+                NIXL_INFO << "  - " << dev;
+            }
+            all_devices = filtered_devices;
+        } else {
+            NIXL_WARN << "NIXL_DEVICES filter matched no devices, using all " << all_devices.size();
+        }
+    }
 
     // Create data rails with selected provider - throw on failure
     nixl_status_t rail_status = createDataRails(all_devices, selected_provider_name);
@@ -76,14 +111,14 @@ nixlLibfabricRailManager::~nixlLibfabricRailManager() {
 }
 
 nixl_status_t
-nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_devices,
+nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &fabric_devices,
                                           const std::string &provider_name) {
-    num_data_rails_ = efa_devices.size();
+    num_data_rails_ = fabric_devices.size();
     // Pre-allocate to ensure contiguous memory allocation
     data_rails_.reserve(num_data_rails_);
 
-    // Build EFA device to rail index mapping for O(1) lookup
-    efa_device_to_rail_map.reserve(num_data_rails_);
+    // Build fabric device to rail index mapping for O(1) lookup
+    device_to_rail_map.reserve(num_data_rails_);
 
     try {
         data_rails_.clear();
@@ -91,13 +126,13 @@ nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_de
 
         for (size_t i = 0; i < num_data_rails_; ++i) {
             data_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i)));
+                fabric_devices[i], provider_name, static_cast<uint16_t>(i)));
 
-            // Initialize EFA device mapping
-            efa_device_to_rail_map[efa_devices[i]] = i;
+            // Initialize fabric device mapping
+            device_to_rail_map[fabric_devices[i]] = i;
 
-            NIXL_DEBUG << "Created data rail " << i << " (device=" << efa_devices[i]
-                       << ", provider=" << provider_name << ")";
+            NIXL_INFO << "Created data rail " << i << " (device: " << fabric_devices[i]
+                       << ", provider: " << provider_name << ")";
         }
     }
     catch (const std::exception &e) {
@@ -108,7 +143,7 @@ nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_de
 }
 
 nixl_status_t
-nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &efa_devices,
+nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &fabric_devices,
                                              const std::string &provider_name,
                                              size_t num_control_rails) {
     // Pre-allocate to ensure contiguous memory allocation
@@ -121,9 +156,9 @@ nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &efa
 
         for (size_t i = 0; i < num_control_rails_; ++i) {
             control_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i)));
-            NIXL_DEBUG << "Created control rail " << i << " (device=" << efa_devices[i]
-                       << ", provider=" << provider_name << ")";
+                fabric_devices[i], provider_name, static_cast<uint16_t>(i)));
+            NIXL_INFO << "Created control rail " << i << " (device: " << fabric_devices[i]
+                       << ", provider: " << provider_name << ")";
         }
     }
     catch (const std::exception &e) {
@@ -169,8 +204,11 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
         const auto counter_value = round_robin_counter.fetch_add(1);
         const size_t rail_id = selected_rails[counter_value % selected_rails.size()];
         const size_t remote_ep_id =
-            remote_selected_endpoints[counter_value % remote_selected_endpoints.size()];
-        NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id " << remote_ep_id;
+            remote_selected_endpoints[counter_value % remote_selected_endpoints.size()];        NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id " << remote_ep_id;
+
+        // Ensure rail is marked active for progress thread to process completions
+        markRailActive(rail_id);
+
         // Allocate request
         nixlLibfabricReq *req = data_rails_[rail_id]->allocateDataRequest(op_type, xfer_id);
         if (!req) {
@@ -237,6 +275,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
 
     } else {
         // Striping: distribute across multiple rails
+        NIXL_DEBUG << "Striping path: using " << selected_rails.size() << " rails";
         size_t num_rails = selected_rails.size();
         size_t chunk_size = transfer_size / num_rails;
         size_t remainder = transfer_size % num_rails;
@@ -244,9 +283,13 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
             const size_t rail_id = selected_rails[i];
             const size_t remote_ep_id =
                 remote_selected_endpoints[i % remote_selected_endpoints.size()];
-            NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id=" << remote_ep_id;
+            NIXL_TRACE << "Striping: using rail_id=" << rail_id << " for chunk " << i;
             size_t current_chunk_size = chunk_size + (i == num_rails - 1 ? remainder : 0);
             if (current_chunk_size == 0) break;
+
+            // Ensure rail is marked active for progress thread to process completions
+            markRailActive(rail_id);
+
             // Allocate request
             nixlLibfabricReq *req = data_rails_[rail_id]->allocateDataRequest(op_type, xfer_id);
             if (!req) {
@@ -327,55 +370,62 @@ nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr,
                                                int gpu_id,
                                                const std::string &gpu_pci_bus_id) const {
     if (mem_type == VRAM_SEG) {
-#ifdef HAVE_CUDA
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI) || defined(HAVE_SYCL)
         if (gpu_id < 0) {
             NIXL_ERROR << "Invalid GPU ID " << gpu_id << " for VRAM memory " << mem_addr;
             return {}; // Return empty vector to indicate failure
         }
 
-        // Use PCI bus ID provided by caller (queried in backend layer)
-        if (gpu_pci_bus_id.empty()) {
-            NIXL_ERROR << "Empty PCI bus ID provided for VRAM memory " << mem_addr;
-            return {}; // Return empty vector to indicate failure
-        }
-
-        // Get EFA devices for this PCI bus ID
-        std::vector<std::string> gpu_efa_devices = topology->getEfaDevicesForGPUPci(gpu_pci_bus_id);
-        if (gpu_efa_devices.empty()) {
-            NIXL_ERROR << "No EFA devices found for PCI " << gpu_pci_bus_id;
-            return {}; // Return empty vector to indicate failure
-        }
         std::vector<size_t> gpu_rails;
-        for (const std::string &efa_device : gpu_efa_devices) {
-            auto it = efa_device_to_rail_map.find(efa_device);
-            if (it != efa_device_to_rail_map.end()) {
-                // Bounds check: ensure rail index is valid
-                if (it->second < data_rails_.size()) {
-                    gpu_rails.push_back(it->second);
-                    NIXL_DEBUG << "VRAM memory " << mem_addr << " on GPU-PCI " << gpu_pci_bus_id
-                               << " mapped to rail " << it->second << " (EFA device=" << efa_device
-                               << ")";
-                } else {
-                    NIXL_WARN << "EFA device " << efa_device << " maps to rail " << it->second
-                              << " but only " << data_rails_.size() << " rails available";
+
+        // If NIXL_DEVICES is set OR provider is not RDMA-based (e.g., shm, tcp),
+        // skip topology lookup and use all available rails directly
+        const char *filter_env = getenv("NIXL_DEVICES");
+        if (filter_env || !topology->isRdmaProvider()) {
+            // Use all available rails directly
+            for (size_t i = 0; i < data_rails_.size(); ++i) {
+                gpu_rails.push_back(i);
+            }
+            NIXL_DEBUG << "Using all " << gpu_rails.size() << " rails for VRAM memory " << mem_addr
+                       << " on GPU " << gpu_id
+                       << " (NIXL_DEVICES=" << (filter_env ? filter_env : "not set")
+                       << ", isRdmaProvider=" << topology->isRdmaProvider() << ")";
+        } else {
+            // Normal path for RDMA providers: use topology to find GPU-NIC affinity
+            std::vector<std::string> gpu_nics = topology->getNicsForGpu(gpu_id);
+            if (gpu_nics.empty()) {
+                NIXL_ERROR << "No NICs found for GPU " << gpu_id;
+                return {}; // Return empty vector to indicate failure
+            }
+
+            for (const std::string &device_name : gpu_nics) {
+                auto it = device_to_rail_map.find(device_name);
+                if (it != device_to_rail_map.end()) {
+                    // Bounds check: ensure rail index is valid
+                    if (it->second < data_rails_.size()) {
+                        gpu_rails.push_back(it->second);
+                        NIXL_DEBUG << "VRAM memory " << mem_addr << " on GPU " << gpu_id
+                                   << " mapped to rail " << it->second
+                                   << " (fabric device: " << device_name << ")";
+                    }
                 }
-            } else {
-                NIXL_WARN << "EFA device " << efa_device
-                          << " not found in rail mapping for GPU-PCI " << gpu_pci_bus_id;
+            }
+
+            if (gpu_rails.empty()) {
+                // Fallback: if no topology-matched rails found, use all available rails
+                NIXL_WARN << "No topology-matched rails for GPU " << gpu_id << ", falling back to all "
+                          << data_rails_.size() << " available rails";
+                for (size_t i = 0; i < data_rails_.size(); ++i) {
+                    gpu_rails.push_back(i);
+                }
             }
         }
 
-        if (gpu_rails.empty()) {
-            NIXL_ERROR << "No valid rail mapping found for GPU-PCI " << gpu_pci_bus_id
-                       << " (checked " << gpu_efa_devices.size() << " EFA devices)";
-            return {};
-        }
-
-        NIXL_DEBUG << "VRAM memory " << mem_addr << " on GPU-PCI " << gpu_pci_bus_id << " will use "
+        NIXL_DEBUG << "VRAM memory " << mem_addr << " on GPU " << gpu_id << " will use "
                    << gpu_rails.size() << " rails total";
         return gpu_rails;
 #else
-        NIXL_ERROR << "VRAM memory type not supported without CUDA";
+        NIXL_ERROR << "VRAM memory type not supported without CUDA/SYNAPSEAI/SYCL";
         return {};
 #endif
     }
@@ -403,6 +453,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
                                          nixl_mem_t mem_type,
                                          int gpu_id,
                                          const std::string &gpu_pci_bus_id,
+                                         const std::string &hmem_hint,
                                          std::vector<struct fid_mr *> &mr_list_out,
                                          std::vector<uint64_t> &key_list_out,
                                          std::vector<size_t> &selected_rails_out) {
@@ -427,7 +478,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
     key_list_out.resize(data_rails_.size(), FI_KEY_NOTAVAIL);
     selected_rails_out = selected_rails; // Return which rails were selected
 
-    // Register memory on each selected rail
+    // Register memory on each selected rail with HMEM hint
     for (size_t i = 0; i < selected_rails.size(); ++i) {
         size_t rail_idx = selected_rails[i];
         if (rail_idx >= data_rails_.size()) {
@@ -445,9 +496,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
 
         struct fid_mr *mr;
         uint64_t key;
-        // Pass gpu_id parameter to individual rail's registerMemory calls
-        nixl_status_t status =
-            data_rails_[rail_idx]->registerMemory(buffer, length, mem_type, gpu_id, &mr, &key);
+        nixl_status_t status = data_rails_[rail_idx]->registerMemory(buffer, length, mem_type, hmem_hint, gpu_id, &mr, &key);
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "Failed to register memory on rail " << rail_idx;
             // Cleanup already registered MRs
@@ -459,6 +508,8 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
                 }
             }
             return status;
+        } else {
+            NIXL_INFO << \"Finished register memory on rail \" << rail_idx << \" with length \" << length << \" on gpu id \" << gpu_id;
         }
 
         mr_list_out[rail_idx] = mr;
@@ -467,7 +518,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
         // Mark rail as active for progress tracking optimization
         markRailActive(rail_idx);
 
-        NIXL_DEBUG << "Registered memory on rail " << rail_idx
+        NIXL_INFO << \"Registered memory on rail \" << rail_idx
                    << " (mr=" << static_cast<const void *>(mr) << ", key=" << key << ")";
     }
 
@@ -936,4 +987,28 @@ size_t
 nixlLibfabricRailManager::getActiveRailCount() const {
     std::lock_guard<std::mutex> lock(active_rails_mutex_);
     return active_rails_.size();
+}
+
+int
+nixlLibfabricRailManager::getNumNvidiaGpus() const {
+    if (topology) {
+        return topology->getNumNvidiaGpus();
+    }
+    return 0;
+}
+
+int
+nixlLibfabricRailManager::getNumIntelHpus() const {
+    if (topology) {
+        return topology->getNumIntelHpus();
+    }
+    return 0;
+}
+
+int
+nixlLibfabricRailManager::getNumIntelXpus() const {
+    if (topology) {
+        return topology->getNumIntelXpus();
+    }
+    return 0;
 }

@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026 Amazon.com, Inc. and affiliates.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 Amazon.com, Inc. and affiliates.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,19 +21,19 @@
 #include "libfabric_common.h"
 #include "nixl.h"
 #include <hwloc.h>
-#include <unordered_map>
+#include <map>
 
 /**
- * @brief Topology discovery and management for AWS instances with EFA devices
+ * @brief Topology discovery and management for libfabric devices
  *
- * Automatically discovers system topology using hwloc and maps GPUs to EFA devices
- * based on PCIe proximity for optimal performance. Falls back to TCP/sockets
- * when EFA devices are not available.
+ * Automatically discovers system topology using hwloc and maps GPUs to NICs
+ * based on PCIe proximity for optimal performance. Supports EFA, verbs, and other
+ * RDMA providers. Falls back to TCP/sockets when RDMA devices are not available.
  */
 class nixlLibfabricTopology {
 private:
-    // PCI bus ID to EFA device mapping: "0000:72:00.0"→[efa0,efa1], etc.
-    std::unordered_map<std::string, std::vector<std::string>> pci_to_efa_devices;
+    // GPU to NIC mapping for RDMA providers: GPU 0→[rdmap0s6-rdm,rdmap1s6-rdm], GPU 1→[rdmap2s6-rdm,rdmap3s6-rdm], etc.
+    std::map<int, std::vector<std::string>> gpu_to_nics;
 
     // All available network devices discovered on this system
     std::vector<std::string> all_devices;
@@ -42,7 +42,10 @@ private:
     std::string provider_name;
 
     // System information
-    int num_gpus;
+    int num_gpus;  // Total GPUs (NVIDIA + Intel HPU)
+    int num_nvidia_gpus;  // NVIDIA GPU count
+    int num_intel_hpus;   // Intel Habana HPU count
+    int num_intel_xpus;   // Intel XPU count
     int num_numa_nodes;
     int num_devices;
 
@@ -53,12 +56,13 @@ private:
     hwloc_topology_t hwloc_topology;
 
     // PCIe to Libfabric device mapping
-    std::unordered_map<std::string, std::string> pcie_to_libfabric_map;
-    std::unordered_map<std::string, std::string> libfabric_to_pcie_map;
+    // One PCIe address can have multiple libfabric devices (bonded case)
+    std::map<std::string, std::vector<std::string>> pcie_to_libfabric_map;
+    std::map<std::string, std::string> libfabric_to_pcie_map;
 
     // Helper methods
     nixl_status_t
-    discoverEfaDevices();
+    discoverDevices();
     nixl_status_t
     discoverTopology();
 
@@ -72,9 +76,9 @@ private:
     nixl_status_t
     discoverGpusWithHwloc();
     nixl_status_t
-    discoverEfaDevicesWithHwloc();
+    discoverDevicesWithHwloc();
     nixl_status_t
-    buildGpuToEfaMapping();
+    buildGpuToNicMapping();
     void
     cleanupHwlocTopology();
 
@@ -117,9 +121,15 @@ private:
     std::string
     getPcieAddressFromHwlocObj(hwloc_obj_t obj) const;
     bool
+    isIntelHpu(hwloc_obj_t obj) const;
+    bool
+    isIntelXpu(hwloc_obj_t obj) const;
+    bool
     isNvidiaGpu(hwloc_obj_t obj) const;
     bool
     isEfaDevice(hwloc_obj_t obj) const;
+    bool
+    isMellanoxNic(hwloc_obj_t obj) const;
 
 public:
     nixlLibfabricTopology(); // Automatically discovers topology
@@ -127,12 +137,27 @@ public:
 
     // GPU-based queries (main interface)
     std::vector<std::string>
-    getEfaDevicesForGPUPci(const std::string &pci_bus_id) const;
+    getNicsForGpu(int gpu_id) const;
 
     // System information
     int
     getNumGpus() const {
         return num_gpus;
+    }
+
+    int
+    getNumNvidiaGpus() const {
+        return num_nvidia_gpus;
+    }
+
+    int
+    getNumIntelHpus() const {
+        return num_intel_hpus;
+    }
+
+    int
+    getNumIntelXpus() const {
+        return num_intel_xpus;
     }
 
     const std::vector<std::string> &
@@ -152,7 +177,11 @@ public:
     }
 
     bool
-    isValidDevice(const std::string &efa_device) const;
+    isRdmaProvider() const;
+    bool
+    isValidGpuId(int gpu_id) const;
+    bool
+    isValidDevice(const std::string &device_name) const;
 
     // Debug/info
     void

@@ -277,6 +277,21 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
         NIXL_DEBUG << "Using default striping threshold: " << striping_threshold_ << " bytes";
     }
 
+    // Parse default HMEM interface parameter
+    // Auto-detect from topology if not specified
+    std::string hmem_iface_str;
+    if (getInitParam("default_hmem_iface", hmem_iface_str) == NIXL_SUCCESS) {
+        default_hmem_iface_ = hmem_iface_str;
+        NIXL_DEBUG << "Using custom default HMEM interface from backend params: " << default_hmem_iface_;
+    } else {
+        // Auto-detect device type from topology
+        // Note: topology discovery happens in rail_manager constructor
+        // For now, leave empty to use GDR fallback by default
+        // SynapseAI will be auto-detected per-registration via /dev/accel check
+        default_hmem_iface_ = "";
+        NIXL_DEBUG << "No default HMEM interface specified, will auto-detect per-registration";
+    }
+
     // Initialize Rail Manager which will discover the topology and create all rails.
     try {
         NIXL_DEBUG << "Rail Manager created with " << rail_manager.getNumDataRails()
@@ -691,6 +706,10 @@ nixlLibfabricEngine::establishConnection(const std::string &remote_agent) const 
     memcpy(control_request->buffer, serialized_conn_info.data(), serialized_conn_info.length());
     control_request->buffer_size = serialized_conn_info.length();
 
+    NIXL_INFO << "Posting CONNECTION_REQ to control_rail_remote_addr: "
+              << conn_info->control_rail_remote_addr_list_[0]
+              << " agent_index: " << it->second->agent_index_;
+
     nixl_status_t status = rail_manager.postControlMessage(
         nixlLibfabricRailManager::ControlMessageType::CONNECTION_REQ,
         control_request,
@@ -703,16 +722,28 @@ nixlLibfabricEngine::establishConnection(const std::string &remote_agent) const 
         // TODO, wrap req info into a nixlLibfabricRequestHandle and add retry logic
         return NIXL_ERR_BACKEND;
     }
+
+    NIXL_INFO << "CONNECTION_REQ posted successfully, waiting for ACK...";
     // Register the connection state tracker with the CM thread
-    // Wait for the CM thread to establish the connection
-    // TODO: Currently blocking, update to timeout and return NIXL_IN_PROG
+    // Wait for the CM thread to establish the connection with timeout
     {
         std::unique_lock<std::mutex> lock(conn_info->conn_state_mutex_);
         NIXL_DEBUG << "Waiting for connection to be established for agent: " << remote_agent;
-        conn_info->cv_.wait(lock, [conn_info] {
+
+        // Use timeout to avoid indefinite blocking - 30 seconds should be sufficient
+        constexpr auto connection_timeout = std::chrono::seconds(30);
+        bool wait_result = conn_info->cv_.wait_for(lock, connection_timeout, [conn_info] {
             return conn_info->overall_state_ == ConnectionState::CONNECTED ||
                 conn_info->overall_state_ == ConnectionState::FAILED;
         });
+
+        if (!wait_result) {
+            NIXL_ERROR << "Connection timeout after 30 seconds waiting for ACK from agent: "
+                       << remote_agent;
+            conn_info->overall_state_ = ConnectionState::FAILED;
+            return NIXL_ERR_BACKEND;
+        }
+
         NIXL_DEBUG << "Connection state for agent " << remote_agent << " is now "
                    << conn_info->overall_state_;
 
@@ -734,7 +765,7 @@ nixl_mem_list_t
 nixlLibfabricEngine::getSupportedMems() const {
     nixl_mem_list_t mems;
     mems.push_back(DRAM_SEG);
-#ifdef HAVE_CUDA
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI) || defined(HAVE_SYCL)
     mems.push_back(VRAM_SEG);
 #endif
     return mems;
@@ -751,9 +782,10 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
     priv->gpu_device_id_ = mem.devId; // Store GPU device ID
 
     std::string pci_bus_id = "";
-#ifdef HAVE_CUDA
-    // Handle CUDA memory registration with GPU Direct RDMA support
     if (nixl_mem == VRAM_SEG) {
+#ifdef HAVE_CUDA
+        // Handle CUDA memory registration with GPU Direct RDMA support
+
         // For multi-GPU support, skip CUDA address workaround
         if (cuda_addr_wa_) {
             bool need_restart;
@@ -793,28 +825,90 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
     }
 #endif
 
+#ifdef HAVE_SYNAPSEAI
+        // Handle SynapseAI memory registration
+        NIXL_DEBUG << "Registering SynapseAI device memory for device " << mem.devId;
+        // SynapseAI-specific setup would go here if needed
+#endif
+
+#ifdef HAVE_SYCL
+        // Handle SYCL device memory registration
+        NIXL_DEBUG << "Registering SYCL device memory for device " << mem.devId;
+        // SYCL-specific setup would go here if needed
+#endif
+    }
+
     // Initialize vectors to accommodate all possible rails (for indexing consistency)
     priv->rail_mr_list_.resize(rail_manager.getNumDataRails(), nullptr);
     priv->rail_key_list_.clear();
     priv->rail_key_list_.resize(rail_manager.getNumDataRails(), FI_KEY_NOTAVAIL);
 
-#ifdef HAVE_CUDA
-    // Set CUDA context before libfabric operations for VRAM
     if (nixl_mem == VRAM_SEG) {
+#ifdef HAVE_CUDA
+        // Set CUDA context before libfabric operations for VRAM
         vramApplyCtx();
-    }
 #endif
+#ifdef HAVE_SYNAPSEAI
+        // SynapseAI context application would go here if needed
+#endif
+
+#ifdef HAVE_SYCL
+        // todo: SYCL context setting
+#endif
+    }
+
+    // Determine HMEM interface hint based on priority:
+    // 1. Environment variables (highest priority)
+    // 2. Per-registration hints via metaInfo blob
+    // 3. Backend-wide defaults from custom params
+    // 4. Auto-detection (fallback - empty string)
+    std::string hmem_hint;
+
+    // Priority 1: Check environment variables
+    const char* env_hmem = getenv("HMEM_IFACE");
+    if (env_hmem && env_hmem[0] != '\0') {
+        hmem_hint = env_hmem;
+        NIXL_DEBUG << "Using HMEM interface from environment variable: " << hmem_hint;
+    }
+    // Priority 2: Check per-registration hint from metaInfo
+    else if (!mem.metaInfo.empty()) {
+        hmem_hint = std::string(mem.metaInfo.begin(), mem.metaInfo.end());
+        NIXL_DEBUG << "Using HMEM interface from metaInfo hint: " << hmem_hint;
+    }
+    // Priority 3: Use backend-wide default
+    else if (!default_hmem_iface_.empty()) {
+        hmem_hint = default_hmem_iface_;
+        NIXL_DEBUG << "Using HMEM interface from backend default: " << hmem_hint;
+    }
+    // Priority 4: Auto-detect from system topology
+    else {
+        // Auto-detect device type based on topology discovery
+        // Intel HPU requires FI_HMEM_SYNAPSEAI (no GDR support exists)
+        // NVIDIA GPU can use GDR fallback (empty hint)
+        if (nixl_mem == VRAM_SEG && rail_manager.getNumIntelHpus() > 0) {
+            hmem_hint = "SYNAPSEAI";
+            NIXL_DEBUG << "Auto-detected Intel HPU system, using HMEM interface: SYNAPSEAI";
+        } else if (nixl_mem == VRAM_SEG && rail_manager.getNumIntelXpus() > 0) {
+            hmem_hint = "ze";
+            NIXL_DEBUG << "Auto-detected Intel XPU system, using HMEM interface: ZE";
+        } else {
+            // Leave empty for GDR fallback (CUDA) or DRAM
+            NIXL_DEBUG << "Auto-detection: using GDR fallback (empty hint)";
+        }
+    }
 
     // Use Rail Manager for centralized memory registration with GPU Direct RDMA support
     NIXL_TRACE << "Registering memory: addr=" << (void *)mem.addr << " len=" << mem.len
                << " mem_type=" << nixl_mem << " devId=" << mem.devId
-               << (nixl_mem == VRAM_SEG ? " pci_bus_id=" + pci_bus_id : "");
+               << (nixl_mem == VRAM_SEG ? " pci_bus_id=" + pci_bus_id : "")
+               << " hmem_hint=" << (hmem_hint.empty() ? "auto" : hmem_hint);
 
     nixl_status_t status = rail_manager.registerMemory((void *)mem.addr,
                                                        mem.len,
                                                        nixl_mem,
                                                        mem.devId,
                                                        pci_bus_id,
+                                                       hmem_hint,
                                                        priv->rail_mr_list_,
                                                        priv->rail_key_list_,
                                                        priv->selected_rails_);
@@ -1067,8 +1161,8 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
         int gpu_id = local[desc_idx].devId;
 
         NIXL_DEBUG << "Processing descriptor " << desc_idx << " GPU " << gpu_id
-                   << " local_addr: " << transfer_addr << " size=" << transfer_size
-                   << " remote_addr=" << (void *)remote[desc_idx].addr;
+                   << " local_addr: " << transfer_addr << " size: " << transfer_size
+                   << " remote_addr: " << (void *)remote[desc_idx].addr;
 
         NIXL_DEBUG << "DEBUG: remote_agent='" << remote_agent << "' localAgent='" << localAgent
                    << "'";
@@ -1421,14 +1515,25 @@ nixlLibfabricEngine::getNotifs(notif_list_t &notif_list) {
 // Background progress function that continuously processes completions on all rails
 nixl_status_t
 nixlLibfabricEngine::cmThread() {
-    NIXL_DEBUG << "CM: Thread started successfully";
+    NIXL_INFO << "ConnectionManagement thread started for " << localAgent
+              << ", blocking_cq_sread_supported: "
+              << rail_manager.getControlRail(0).blocking_cq_sread_supported;
+    NIXL_INFO << "Initial receives already posted in main thread, entering progress loop";
 
+    int loop_count = 0;
     // Main progress loop - continuously process completions on all rails
     while (!cm_thread_stop_.load()) {
+        loop_count++;
+        // Log every 10 iterations (with 1-second blocking, this is every ~10 seconds)
+        if (loop_count % 10 == 0) {
+            NIXL_INFO << "CM thread for " << localAgent << " loop iteration " << loop_count
+                      << " (blocking_cq_sread_supported: "
+                      << rail_manager.getControlRail(0).blocking_cq_sread_supported << ")";
+        }
 
         nixl_status_t status = rail_manager.progressAllControlRails();
         if (status == NIXL_SUCCESS) {
-            NIXL_DEBUG << "CM: Processed completions on control rails";
+            NIXL_INFO << "CM thread for " << localAgent << " processed completions on control rails";
         } else if (status != NIXL_IN_PROG && status != NIXL_SUCCESS) {
             NIXL_ERROR << "CM: Failed to process completions on control rails";
             return NIXL_ERR_BACKEND;
@@ -1604,9 +1709,18 @@ void
 nixlLibfabricEngine::processConnectionAck(uint16_t agent_idx,
                                           nixlLibfabricConnection *conn_info,
                                           ConnectionState state) {
+    NIXL_INFO << "processConnectionAck called with agent_idx: " << agent_idx
+              << " agent_names_ size: " << agent_names_.size();
+
+    if (agent_idx >= agent_names_.size()) {
+        NIXL_ERROR << "Invalid agent_idx " << agent_idx << " >= agent_names_.size() "
+                   << agent_names_.size();
+        return;
+    }
+
     std::string remote_agent_name = agent_names_[agent_idx];
-    NIXL_DEBUG << "Connection state callback for agent " << remote_agent_name
-               << " agent_idx=" << agent_idx;
+    NIXL_INFO << "Connection state callback for agent " << remote_agent_name
+              << " agent_idx: " << agent_idx;
     std::lock_guard<std::mutex> lock(connections_[remote_agent_name]->conn_state_mutex_);
     connections_[remote_agent_name]->overall_state_ = ConnectionState::CONNECTED;
     connections_[remote_agent_name]->cv_.notify_all();
@@ -1617,8 +1731,8 @@ nixl_status_t
 nixlLibfabricEngine::processConnectionRequest(uint16_t agent_idx,
                                               const std::string &serialized_data,
                                               nixlLibfabricRail *rail) {
-    NIXL_DEBUG << "Processing connection request from agent " << agent_idx << " on rail "
-               << rail->rail_id;
+    NIXL_INFO << "Processing connection request from agent " << agent_idx << " on rail "
+              << rail->rail_id << " serialized_data length: " << serialized_data.length();
 
     // Use rail manager to deserialize ALL endpoints at once with "src" prefix (connection request
     // contains source endpoints)
@@ -1687,7 +1801,7 @@ nixlLibfabricEngine::processConnectionRequest(uint16_t agent_idx,
         return ack_status;
     }
 
-    NIXL_DEBUG << "ACK sent successfully via rail manager";
+    NIXL_INFO << "ACK sent successfully via rail manager to fi_addr " << initiator_control_fi_addr;
     return NIXL_SUCCESS;
 }
 

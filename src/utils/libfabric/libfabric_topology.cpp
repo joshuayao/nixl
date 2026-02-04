@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026 Amazon.com, Inc. and affiliates.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 Amazon.com, Inc. and affiliates.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@
 #include <sstream>
 #include <algorithm>
 #include <set>
+#include <climits>
 
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
@@ -34,6 +35,9 @@
 
 nixlLibfabricTopology::nixlLibfabricTopology()
     : num_gpus(0),
+      num_nvidia_gpus(0),
+      num_intel_hpus(0),
+      num_intel_xpus(0),
       num_numa_nodes(0),
       num_devices(0),
       topology_discovered(false),
@@ -65,18 +69,18 @@ nixlLibfabricTopology::discoverTopology() {
         NIXL_ERROR << "Failed to initialize hwloc topology";
         return status;
     }
-    // Discover EFA devices using libfabric
-    status = discoverEfaDevices();
+    // Discover fabric devices using libfabric
+    status = discoverDevices();
     if (status != NIXL_SUCCESS) {
         return status;
     }
-    // For EFA devices, build PCIe to Libfabric device mapping and full topology
-    if (provider_name == "efa") {
+    // For RDMA providers (EFA, verbs, etc.), build PCIe to Libfabric device mapping and full topology
+    if (isRdmaProvider()) {
         // Build PCIe to Libfabric device mapping
         status = buildPcieToLibfabricMapping();
         if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to build PCIe to Libfabric mapping - this is required for EFA "
-                          "topology discovery";
+            NIXL_ERROR << "Failed to build PCIe to Libfabric mapping - this is required for "
+                       << provider_name << " topology discovery";
             return status;
         }
         // Discover hardware topology using hwloc
@@ -85,10 +89,10 @@ nixlLibfabricTopology::discoverTopology() {
             NIXL_ERROR << "Failed to discover hwloc topology";
             return status;
         }
-        // Build GPU to EFA mapping based on PCIe topology
-        status = buildGpuToEfaMapping();
+        // Build GPU to NIC mapping based on PCIe topology
+        status = buildGpuToNicMapping();
         if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to build GPU to EFA mapping";
+            NIXL_ERROR << "Failed to build GPU to NIC mapping for " << provider_name;
             return status;
         }
     } else {
@@ -98,6 +102,9 @@ nixlLibfabricTopology::discoverTopology() {
 
         // Set basic values without hwloc discovery
         num_gpus = 0; // TCP doesn't need GPU topology
+        num_nvidia_gpus = 0;
+        num_intel_hpus = 0;
+        num_intel_xpus = 0;
         num_numa_nodes = 1; // Simple fallback
 
         // For TCP/sockets devices, no GPU-mapping required.
@@ -108,8 +115,18 @@ nixlLibfabricTopology::discoverTopology() {
     return NIXL_SUCCESS;
 }
 
+bool
+nixlLibfabricTopology::isRdmaProvider() const {
+    // Check for exact match or composite provider (e.g., "verbs;ofi_rxm")
+    return (provider_name == "efa" ||
+            provider_name == "verbs" ||
+            provider_name.rfind("verbs;", 0) == 0 ||  // verbs;ofi_rxm, verbs;*
+            provider_name == "psm2" ||
+            provider_name == "cxi");
+}
+
 nixl_status_t
-nixlLibfabricTopology::discoverEfaDevices() {
+nixlLibfabricTopology::discoverDevices() {
     // Use the utility function from libfabric_common
     auto network_device = LibfabricUtils::getAvailableNetworkDevices();
     provider_name = network_device.first;
@@ -117,77 +134,65 @@ nixlLibfabricTopology::discoverEfaDevices() {
 
     num_devices = all_devices.size();
 
-    // Set device type based on discovered provider
+    // Log discovered provider and device count
     if (provider_name == "efa") {
         NIXL_INFO << "Discovered " << num_devices << " EFA devices";
+    } else if (provider_name == "verbs") {
+        NIXL_INFO << "Discovered " << num_devices << " verbs devices (RDMA)";
     } else if (provider_name == "sockets") {
         NIXL_INFO << "Discovered " << num_devices << " socket devices (TCP fallback)";
     } else if (provider_name == "none" || all_devices.empty()) {
         NIXL_WARN << "No network devices found";
         return NIXL_ERR_BACKEND;
+    } else {
+        NIXL_INFO << "Discovered " << num_devices << " " << provider_name << " devices";
     }
 
     for (size_t i = 0; i < all_devices.size(); ++i) {
-        NIXL_TRACE << "Network device " << i << ": " << all_devices[i]
-                   << " (provider=" << provider_name << ")";
+        NIXL_TRACE << "Device " << i << ": " << all_devices[i]
+                   << " (provider: " << provider_name << ")";
     }
     return NIXL_SUCCESS;
 }
 
 std::vector<std::string>
-nixlLibfabricTopology::getEfaDevicesForGPUPci(const std::string &pci_bus_id) const {
-    // Normalize PCI bus ID format to match hwloc format
-    // CUDA format: "0000:59:00.0" → hwloc format: "0:59:00.0"
-    unsigned int domain, bus, device, function;
-    if (sscanf(pci_bus_id.c_str(), "%x:%x:%x.%x", &domain, &bus, &device, &function) == 4) {
-        char normalized_pci[32];
-        snprintf(normalized_pci,
-                 sizeof(normalized_pci),
-                 "%x:%02x:%02x.%x",
-                 domain,
-                 bus,
-                 device,
-                 function);
-        std::string normalized_id(normalized_pci);
-
-        auto it = pci_to_efa_devices.find(normalized_id);
-        if (it != pci_to_efa_devices.end()) {
-            NIXL_DEBUG << "Found EFA devices for PCI " << pci_bus_id << " (normalized to "
-                       << normalized_id << ")";
-            return it->second;
-        }
-        // PCI ID parsed successfully but not found in mapping
-        NIXL_WARN << "PCI bus ID " << pci_bus_id << " (normalized to " << normalized_id
-                  << ") not found in GPU-EFA mapping, returning all devices";
-    } else {
-        // Failed to parse PCI bus ID format
-        NIXL_WARN << "Failed to parse PCI bus ID format: " << pci_bus_id
-                  << ", returning all devices";
+nixlLibfabricTopology::getNicsForGpu(int gpu_id) const {
+    auto it = gpu_to_nics.find(gpu_id);
+    if (it != gpu_to_nics.end()) {
+        return it->second;
     }
-
+    // Use DEBUG level since this is expected for providers like shm that don't use NICs
+    NIXL_DEBUG << "No NICs found for GPU " << gpu_id << ", returning all devices";
     return all_devices;
 }
 
 bool
-nixlLibfabricTopology::isValidDevice(const std::string &efa_device) const {
-    return std::find(all_devices.begin(), all_devices.end(), efa_device) != all_devices.end();
+nixlLibfabricTopology::isValidGpuId(int gpu_id) const {
+    return gpu_id >= 0 && gpu_id < num_gpus;
+}
+
+bool
+nixlLibfabricTopology::isValidDevice(const std::string &device_name) const {
+    return std::find(all_devices.begin(), all_devices.end(), device_name) != all_devices.end();
 }
 
 void
 nixlLibfabricTopology::printTopologyInfo() const {
     NIXL_TRACE << "=== Libfabric Topology Information ===";
     NIXL_TRACE << "Topology discovered: " << (topology_discovered ? "Yes" : "No");
-    NIXL_TRACE << "Number of GPUs: " << num_gpus;
+    NIXL_TRACE << "Provider: " << provider_name;
+    NIXL_TRACE << "Number of GPUs: " << num_gpus << " (" << num_nvidia_gpus << " NVIDIA, "
+               << num_intel_hpus << " Intel HPU)" << num_intel_xpus << " Intel XPU";
     NIXL_TRACE << "Number of NUMA nodes: " << num_numa_nodes;
-    NIXL_TRACE << "Number of EFA devices: " << num_devices;
-    NIXL_TRACE << "EFA devices: ";
+    NIXL_TRACE << "Number of devices: " << num_devices;
+    NIXL_TRACE << "Available devices: ";
     for (size_t i = 0; i < all_devices.size(); ++i) {
         NIXL_TRACE << "  [" << i << "] " << all_devices[i];
     }
-    NIXL_TRACE << "GPU-PCI → EFA mapping:";
-    for (const auto &pair : pci_to_efa_devices) {
+    NIXL_TRACE << "GPU → NIC mapping:";
+    for (const auto &pair : gpu_to_nics) {
         std::stringstream ss;
-        ss << "  GPU-PCI " << pair.first << " → [";
+        ss << "  GPU " << pair.first << " → [";
         for (size_t i = 0; i < pair.second.size(); ++i) {
             if (i > 0) ss << ", ";
             ss << pair.second[i];
@@ -195,7 +200,7 @@ nixlLibfabricTopology::printTopologyInfo() const {
         ss << "]";
         NIXL_TRACE << ss.str();
     }
-    NIXL_TRACE << "Host memory (DRAM) will use all available EFA devices for maximum bandwidth";
+    NIXL_TRACE << "Host memory (DRAM) will use all available devices for maximum bandwidth";
     NIXL_TRACE << "=====================================";
 }
 
@@ -203,9 +208,10 @@ std::string
 nixlLibfabricTopology::getTopologyString() const {
     std::stringstream ss;
     ss << "Libfabric Topology: ";
+    ss << "Provider=" << provider_name << ", ";
     ss << "GPUs=" << num_gpus << ", ";
     ss << "NUMA=" << num_numa_nodes << ", ";
-    ss << "EFA=" << num_devices << ", ";
+    ss << "Devices=" << num_devices << ", ";
     ss << "Discovered=" << (topology_discovered ? "Yes" : "No");
     return ss.str();
 }
@@ -234,7 +240,7 @@ nixlLibfabricTopology::initHwlocTopology() {
         return NIXL_ERR_BACKEND;
     }
 
-    // Enable I/O device discovery - this is the key to seeing EFA devices!
+    // Enable I/O device discovery - this is the key to seeing PCIe NICs!
 #if (HWLOC_API_VERSION >= 0x00020000)
     enum hwloc_type_filter_e filter = HWLOC_TYPE_FILTER_KEEP_ALL;
     ret = hwloc_topology_set_io_types_filter(hwloc_topology, filter);
@@ -291,15 +297,15 @@ nixlLibfabricTopology::discoverHwlocTopology() {
         NIXL_ERROR << "hwloc topology not initialized";
         return NIXL_ERR_BACKEND;
     }
-    // Discover GPUs and EFA devices using hwloc
+    // Discover GPUs and fabric devices using hwloc
     nixl_status_t status = discoverGpusWithHwloc();
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Failed to discover GPUs with hwloc";
         return status;
     }
-    status = discoverEfaDevicesWithHwloc();
+    status = discoverDevicesWithHwloc();
     if (status != NIXL_SUCCESS) {
-        NIXL_ERROR << "Failed to discover EFA devices with hwloc";
+        NIXL_ERROR << "Failed to discover devices with hwloc";
         return status;
     }
     // Discover NUMA topology
@@ -314,7 +320,9 @@ nixlLibfabricTopology::discoverHwlocTopology() {
 
 nixl_status_t
 nixlLibfabricTopology::discoverGpusWithHwloc() {
-    num_gpus = 0;
+    num_nvidia_gpus = 0;
+    num_intel_hpus = 0;
+    num_intel_xpus = 0;
     // Find all PCI devices and log detailed information
     hwloc_obj_t pci_obj = nullptr;
     while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
@@ -325,17 +333,41 @@ nixlLibfabricTopology::discoverGpusWithHwloc() {
             uint16_t device_id = pci_obj->attr->pcidev.device_id;
             uint16_t class_id = pci_obj->attr->pcidev.class_id;
 
-            NIXL_TRACE << "Found NVIDIA GPU " << num_gpus << ": " << pcie_addr
-                       << " (vendor=" << std::hex << vendor_id << ", device=" << device_id
-                       << ", class=" << class_id << std::dec << ")";
+            NIXL_TRACE << "Found NVIDIA GPU " << num_nvidia_gpus << ": " << pcie_addr << " (vendor=0x"
+                       << std::hex << vendor_id << ", device=0x" << device_id << ", class=0x"
+                       << class_id << std::dec << ")";
+            num_nvidia_gpus++;
+        } else if (isIntelHpu(pci_obj)) {
+            std::string pcie_addr = getPcieAddressFromHwlocObj(pci_obj);
+            // Get device and vendor info
+            uint16_t vendor_id = pci_obj->attr->pcidev.vendor_id;
+            uint16_t device_id = pci_obj->attr->pcidev.device_id;
+            uint16_t class_id = pci_obj->attr->pcidev.class_id;
 
-            num_gpus++;
+            NIXL_TRACE << "Found Intel HPU " << num_intel_hpus << ": " << pcie_addr << " (vendor=0x"
+                       << std::hex << vendor_id << ", device=0x" << device_id << ", class=0x"
+                       << class_id << std::dec << ")";
+            num_intel_hpus++;
+        } else if (isIntelXpu(pci_obj)) {
+            std::string pcie_addr = getPcieAddressFromHwlocObj(pci_obj);
+            // Get device and vendor info
+            uint16_t vendor_id = pci_obj->attr->pcidev.vendor_id;
+            uint16_t device_id = pci_obj->attr->pcidev.device_id;
+            uint16_t class_id = pci_obj->attr->pcidev.class_id;
+
+            NIXL_TRACE << "Found Intel XPU " << num_intel_hpus << ": " << pcie_addr << " (vendor=0x"
+                       << std::hex << vendor_id << ", device=0x" << device_id << ", class=0x"
+                       << class_id << std::dec << ")";
+            num_intel_xpus++;
         }
     }
 
-    NIXL_TRACE << "Discovered " << num_gpus << " NVIDIA GPUs via hwloc";
+    num_gpus = num_nvidia_gpus + num_intel_hpus + num_intel_xpus;
+    NIXL_TRACE << "Discovered " << num_gpus << " GPUs via hwloc (" << num_nvidia_gpus
+               << " NVIDIA, " << num_intel_hpus << " Intel HPU " << num_intel_xpus << "Intel XPU)";
 
     // If we found more than 8 GPUs on P5en, investigate further
+    // FIXME: add Habana related messages
     if (num_gpus > 8) {
         NIXL_WARN << "Found " << num_gpus
                   << " NVIDIA GPUs, but P5en should have 8. Investigating...";
@@ -349,8 +381,8 @@ nixlLibfabricTopology::discoverGpusWithHwloc() {
                 uint16_t device_id = pci_obj->attr->pcidev.device_id;
                 uint16_t class_id = pci_obj->attr->pcidev.class_id;
 
-                NIXL_WARN << "NVIDIA device " << gpu_count << ": " << pcie_addr << " (device"
-                          << std::hex << device_id << ", class=" << class_id << std::dec << ")";
+                NIXL_WARN << "NVIDIA device " << gpu_count << ": " << pcie_addr << " (device=0x"
+                          << std::hex << device_id << ", class=0x" << class_id << std::dec << ")";
                 gpu_count++;
             }
         }
@@ -359,24 +391,47 @@ nixlLibfabricTopology::discoverGpusWithHwloc() {
 }
 
 nixl_status_t
-nixlLibfabricTopology::discoverEfaDevicesWithHwloc() {
-    // EFA devices are already discovered via libfabric
+nixlLibfabricTopology::discoverDevicesWithHwloc() {
+    // Fabric devices are already discovered via libfabric
     // This method validates the hwloc discovery matches libfabric discovery
-    int hwloc_efa_count = 0;
-    hwloc_obj_t pci_obj = nullptr;
-    while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
-        if (isEfaDevice(pci_obj)) {
-            hwloc_efa_count++;
-            NIXL_TRACE << "Found EFA device via hwloc: " << getPcieAddressFromHwlocObj(pci_obj);
+    // Only validate for providers with specific hwloc checks
+    if (provider_name == "efa") {
+        int hwloc_device_count = 0;
+        hwloc_obj_t pci_obj = nullptr;
+        while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
+            if (isEfaDevice(pci_obj)) {
+                hwloc_device_count++;
+                NIXL_TRACE << "Found EFA device via hwloc: " << getPcieAddressFromHwlocObj(pci_obj);
+            }
         }
-    }
 
-    NIXL_TRACE << "hwloc found " << hwloc_efa_count << " EFA devices, libfabric found "
-               << num_devices;
+        NIXL_TRACE << "hwloc found " << hwloc_device_count << " EFA devices, libfabric found "
+                   << num_devices;
 
-    if (hwloc_efa_count != num_devices) {
-        NIXL_DEBUG << "Mismatch between hwloc (" << hwloc_efa_count << ") and libfabric ("
-                   << num_devices << ") EFA device counts";
+        if (hwloc_device_count != num_devices) {
+            NIXL_WARN << "Mismatch between hwloc (" << hwloc_device_count << ") and libfabric ("
+                      << num_devices << ") EFA device counts";
+        }
+    } else if (provider_name == "verbs") {
+        int hwloc_device_count = 0;
+        hwloc_obj_t pci_obj = nullptr;
+        while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
+            if (isMellanoxNic(pci_obj)) {
+                hwloc_device_count++;
+                NIXL_TRACE << "Found Mellanox NIC via hwloc: " << getPcieAddressFromHwlocObj(pci_obj);
+            }
+        }
+
+        NIXL_TRACE << "hwloc found " << hwloc_device_count << " Mellanox NICs, libfabric found "
+                   << num_devices;
+
+        if (hwloc_device_count != num_devices) {
+            NIXL_WARN << "Mismatch between hwloc (" << hwloc_device_count << ") and libfabric ("
+                      << num_devices << ") Mellanox NIC counts";
+        }
+    } else {
+        // For other providers (sockets, psm2, etc.), skip hwloc validation
+        NIXL_TRACE << "Skipping hwloc device validation for provider: " << provider_name;
     }
 
     return NIXL_SUCCESS;
@@ -387,7 +442,7 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
     pcie_to_libfabric_map.clear();
     libfabric_to_pcie_map.clear();
 
-    // Get EFA device info with PCIe addresses from libfabric
+    // Get fabric device info with PCIe addresses from libfabric
     struct fi_info *hints, *info;
 
     hints = fi_allocinfo();
@@ -399,7 +454,9 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
     // Configure hints for the discovered provider
     // This ensures consistency between device discovery and PCIe mapping
     hints->fabric_attr->prov_name = strdup(provider_name.c_str());
+    LibfabricUtils::configureHintsForProvider(hints, provider_name);
 
+    // Use FI_VERSION(1, 18) for DMABUF and HMEM support
     int ret = fi_getinfo(FI_VERSION(1, 18), NULL, NULL, 0, hints, &info);
     if (ret) {
         NIXL_ERROR << "fi_getinfo failed for PCIe mapping with provider " << provider_name << ": "
@@ -408,30 +465,80 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
         return NIXL_ERR_BACKEND;
     }
 
+    int device_count = 0;
+    int mapped_count = 0;
     for (struct fi_info *cur = info; cur; cur = cur->next) {
-        if (cur->domain_attr && cur->domain_attr->name && cur->nic && cur->nic->bus_attr) {
-            std::string libfabric_name = cur->domain_attr->name;
-            // Extract PCIe address from bus_attr if available
-            if (cur->nic->bus_attr->bus_type == FI_BUS_PCI &&
-                cur->nic->bus_attr->attr.pci.domain_id != FI_ADDR_UNSPEC) {
-                char pcie_addr[32];
-                snprintf(pcie_addr,
-                         sizeof(pcie_addr),
-                         "%x:%02x:%02x.%x",
-                         cur->nic->bus_attr->attr.pci.domain_id,
-                         cur->nic->bus_attr->attr.pci.bus_id,
-                         cur->nic->bus_attr->attr.pci.device_id,
-                         cur->nic->bus_attr->attr.pci.function_id);
-
-                std::string pcie_address = pcie_addr;
-                pcie_to_libfabric_map[pcie_address] = libfabric_name;
-                libfabric_to_pcie_map[libfabric_name] = pcie_address;
-
-                NIXL_TRACE << "Mapped PCIe " << pcie_address << " → Libfabric " << libfabric_name
-                           << " (provider=" << provider_name << ")";
-            }
+        device_count++;
+        if (!cur->domain_attr || !cur->domain_attr->name) {
+            NIXL_DEBUG << "Device " << device_count << ": missing domain_attr or name";
+            continue;
         }
+
+        std::string libfabric_name = cur->domain_attr->name;
+        NIXL_DEBUG << "Processing device: " << libfabric_name;
+
+        if (!cur->nic) {
+            NIXL_DEBUG << "  Device " << libfabric_name << ": nic is NULL";
+            continue;
+        }
+
+        if (!cur->nic->bus_attr) {
+            NIXL_DEBUG << "  Device " << libfabric_name << ": bus_attr is NULL (likely virtual device, bonded NIC, etc.)";
+            continue;
+        }
+
+        NIXL_DEBUG << "  Device " << libfabric_name << ": bus_type=" << cur->nic->bus_attr->bus_type;
+
+        if (cur->nic->bus_attr->bus_type != FI_BUS_PCI) {
+            NIXL_DEBUG << "  Device " << libfabric_name << ": not a PCI device, trying sysfs fallback";
+
+            // Fallback: Try to get PCIe address from sysfs for bonded/virtual devices
+            std::string sysfs_path = "/sys/class/infiniband/" + libfabric_name + "/device";
+            char resolved_path[PATH_MAX];
+            if (realpath(sysfs_path.c_str(), resolved_path)) {
+                // Parse PCIe address from path like: /sys/devices/pci0000:6d/0000:6d:02.0/0000:6e:00.0
+                std::string path_str(resolved_path);
+                size_t last_slash = path_str.rfind('/');
+                if (last_slash != std::string::npos) {
+                    std::string pcie_addr = path_str.substr(last_slash + 1);
+                    // Verify format: domain:bus:device.function (e.g., 0000:6e:00.0)
+                    if (pcie_addr.length() >= 7 && pcie_addr.find(':') != std::string::npos) {
+                        pcie_to_libfabric_map[pcie_addr].push_back(libfabric_name);
+                        libfabric_to_pcie_map[libfabric_name] = pcie_addr;
+                        mapped_count++;
+                        NIXL_DEBUG << "  Successfully mapped PCIe " << pcie_addr << " → " << libfabric_name << " (via sysfs)";
+                        continue;
+                    }
+                }
+            }
+            NIXL_DEBUG << "  Device " << libfabric_name << ": sysfs fallback failed";
+            continue;
+        }
+
+        if (cur->nic->bus_attr->attr.pci.domain_id == FI_ADDR_UNSPEC) {
+            NIXL_DEBUG << "  Device " << libfabric_name << ": PCIe domain_id is FI_ADDR_UNSPEC";
+            continue;
+        }
+
+        // Extract PCIe address from bus_attr if available
+        char pcie_addr[32];
+        snprintf(pcie_addr,
+                 sizeof(pcie_addr),
+                 "%x:%02x:%02x.%x",
+                 cur->nic->bus_attr->attr.pci.domain_id,
+                 cur->nic->bus_attr->attr.pci.bus_id,
+                 cur->nic->bus_attr->attr.pci.device_id,
+                 cur->nic->bus_attr->attr.pci.function_id);
+
+        std::string pcie_address = pcie_addr;
+        pcie_to_libfabric_map[pcie_address].push_back(libfabric_name);
+        libfabric_to_pcie_map[libfabric_name] = pcie_address;
+        mapped_count++;
+
+        NIXL_DEBUG << "  Successfully mapped PCIe " << pcie_address << " → Libfabric " << libfabric_name;
     }
+
+    NIXL_DEBUG << "PCIe mapping: processed " << device_count << " devices, successfully mapped " << mapped_count;
 
     fi_freeinfo(info);
     fi_freeinfo(hints);
@@ -441,16 +548,16 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
 }
 
 nixl_status_t
-nixlLibfabricTopology::buildGpuToEfaMapping() {
-    pci_to_efa_devices.clear();
-    // Implement NIXL's topology-aware GPU-EFA grouping algorithm
+nixlLibfabricTopology::buildGpuToNicMapping() {
+    gpu_to_nics.clear();
+    // Implement NIXL's topology-aware GPU-NIC grouping algorithm
     nixl_status_t status = buildTopologyAwareGrouping();
     if (status != NIXL_SUCCESS) {
         NIXL_WARN << "Topology-aware grouping failed, using fallback to use all available devices";
         return buildFallbackMapping();
     }
 
-    NIXL_TRACE << "Built PCI→EFA mapping for " << pci_to_efa_devices.size()
+    NIXL_TRACE << "Built GPU→NIC mapping for " << gpu_to_nics.size()
                << " GPUs using topology-aware algorithm";
 
     return NIXL_SUCCESS;
@@ -461,10 +568,32 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
     // Step 1: Build NIC info structures by correlating libfabric with hwloc
     std::vector<NicInfo> discovered_nics;
     std::vector<GpuInfo> discovered_gpus;
+
+    NIXL_DEBUG << "Starting NIC discovery: pcie_to_libfabric_map has " << pcie_to_libfabric_map.size() << " PCIe addresses";
+
     // Discover NICs by correlating libfabric devices with hwloc objects
     for (const auto &pair : pcie_to_libfabric_map) {
         const std::string &pcie_addr = pair.first;
-        const std::string &libfabric_name = pair.second;
+        const std::vector<std::string> &libfabric_devices = pair.second;
+
+        NIXL_DEBUG << "Processing PCIe address " << pcie_addr << " with " << libfabric_devices.size() << " libfabric device(s)";
+
+        // Deduplicate device names (libfabric may return the same device multiple times)
+        std::set<std::string> seen;
+        std::vector<std::string> unique_devices;
+        for (const auto &dev : libfabric_devices) {
+            if (seen.insert(dev).second) {
+                unique_devices.push_back(dev);
+            }
+        }
+
+        if (unique_devices.size() < libfabric_devices.size()) {
+            NIXL_DEBUG << "  Deduplicated " << libfabric_devices.size() << " → " << unique_devices.size() << " devices";
+        }
+
+        // Process all unique libfabric devices that share this PCIe address
+        for (const std::string &libfabric_name : unique_devices) {
+            NIXL_DEBUG << "  Processing device: " << libfabric_name;
 
         // Parse PCIe address
         uint16_t domain_id;
@@ -479,6 +608,9 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
             continue;
         }
 
+        NIXL_DEBUG << "Parsed PCIe address: domain=" << domain_id << ", bus=" << (int)bus_id
+                   << ", device=" << (int)device_id << ", function=" << (int)function_id;
+
         // Find corresponding hwloc object
         hwloc_obj_t hwloc_node =
             hwloc_get_pcidev_by_busid(hwloc_topology, domain_id, bus_id, device_id, function_id);
@@ -492,15 +624,24 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
             nic.device_id = device_id;
             nic.function_id = function_id;
             discovered_nics.push_back(nic);
-            NIXL_TRACE << "Correlated NIC: " << pcie_addr << " → " << libfabric_name;
+            NIXL_DEBUG << "    Successfully correlated NIC: " << pcie_addr << " → " << libfabric_name;
         } else {
-            NIXL_WARN << "Could not find hwloc object for PCIe address: " << pcie_addr;
+            NIXL_WARN << "  Could not find hwloc object for PCIe address: " << pcie_addr;
         }
-    }
+        } // end for each libfabric device
+    } // end for each PCIe address
+
+    NIXL_DEBUG << "NIC discovery complete: found " << discovered_nics.size() << " NICs";
+
     // Step 2: Discover GPUs
+    NIXL_DEBUG << "Starting GPU discovery";
     hwloc_obj_t pci_obj = nullptr;
+    int pci_device_count = 0;
+    int gpu_count = 0;
     while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
-        if (isNvidiaGpu(pci_obj)) {
+        pci_device_count++;
+        if (isNvidiaGpu(pci_obj) || isIntelHpu(pci_obj) || isIntelXpu(pci_obj)) {
+            gpu_count++;
             GpuInfo gpu;
             gpu.hwloc_node = pci_obj;
             gpu.domain_id = pci_obj->attr->pcidev.domain;
@@ -508,8 +649,11 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
             gpu.device_id = pci_obj->attr->pcidev.dev;
             gpu.function_id = pci_obj->attr->pcidev.func;
             discovered_gpus.push_back(gpu);
+            NIXL_DEBUG << "Found GPU at " << std::hex << gpu.domain_id << ":"
+                       << (int)gpu.bus_id << ":" << (int)gpu.device_id << "." << (int)gpu.function_id << std::dec;
         }
     }
+    NIXL_DEBUG << "GPU discovery complete: scanned " << pci_device_count << " PCI devices, found " << discovered_gpus.size() << " GPUs";
 
     NIXL_TRACE << "Discovered " << discovered_nics.size() << " NICs and " << discovered_gpus.size()
                << " GPUs for grouping";
@@ -524,13 +668,13 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
     if (status != NIXL_SUCCESS) {
         return status;
     }
-    // Step 4: Convert groups to GPU→EFA mapping
+    // Step 4: Convert groups to GPU→NIC mapping
     for (size_t group_idx = 0; group_idx < nic_groups.size(); ++group_idx) {
         const auto &group = nic_groups[group_idx];
         if (group.has_gpu) {
-            std::vector<std::string> gpu_efa_devices;
+            std::vector<std::string> gpu_nics;
             for (const auto &nic : group.nics) {
-                gpu_efa_devices.push_back(nic.libfabric_name);
+                gpu_nics.push_back(nic.libfabric_name);
             }
             // Find GPU index in our discovered GPUs list
             int gpu_index = -1;
@@ -546,31 +690,57 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
             }
 
             if (gpu_index >= 0) {
-                // Store mapping using PCI bus ID as key
-                std::string pci_bus_id = getPcieAddressFromHwlocObj(group.closest_gpu.hwloc_node);
-                pci_to_efa_devices[pci_bus_id] = gpu_efa_devices;
+                gpu_to_nics[gpu_index] = gpu_nics;
 
-                NIXL_TRACE << "PCI " << pci_bus_id << " (GPU " << gpu_index << ") → "
-                           << gpu_efa_devices.size() << " EFA devices: [";
-                for (size_t i = 0; i < gpu_efa_devices.size(); ++i) {
-                    if (i > 0) NIXL_TRACE << ", ";
-                    NIXL_TRACE << gpu_efa_devices[i];
-                }
-                NIXL_TRACE << "]";
+                NIXL_TRACE << "GPU " << gpu_index << " (" << std::hex << group.closest_gpu.domain_id
+                           << ":" << static_cast<int>(group.closest_gpu.bus_id) << ":"
+                           << static_cast<int>(group.closest_gpu.device_id) << "."
+                           << static_cast<int>(group.closest_gpu.function_id) << std::dec << ") → "
+                           << gpu_nics.size() << " NICs";
             }
         }
     }
+
+    // Step 5: Handle virtual devices - if all NICs share the same PCIe address,
+    // assign them to all GPUs instead of just the closest one
+    if (!discovered_nics.empty() && pcie_to_libfabric_map.size() == 1) {
+        // All NICs share a single PCIe address - this is a virtual device
+        const std::string &vdev_pcie_addr = pcie_to_libfabric_map.begin()->first;
+        const std::vector<std::string> &vdev_devices = pcie_to_libfabric_map.begin()->second;
+
+        // Deduplicate device names - libfabric may report the same virtual device multiple times
+        std::vector<std::string> unique_devices;
+        std::set<std::string> seen;
+        for (const auto &dev : vdev_devices) {
+            if (seen.insert(dev).second) {
+                unique_devices.push_back(dev);
+            }
+        }
+
+        NIXL_INFO << "Detected virtual device at PCIe " << vdev_pcie_addr
+                  << " with " << vdev_devices.size() << " instances (" << unique_devices.size() << " unique)";
+        NIXL_INFO << "Assigning virtual device to all " << discovered_gpus.size() << " GPUs (if bond, lower layer handles load balancing)";
+
+        // Assign unique virtual device instances to all GPUs
+        for (size_t gpu_idx = 0; gpu_idx < discovered_gpus.size(); ++gpu_idx) {
+            gpu_to_nics[static_cast<int>(gpu_idx)] = unique_devices;
+        }
+    }
+
     return NIXL_SUCCESS;
 }
 
 nixl_status_t
 nixlLibfabricTopology::buildFallbackMapping() {
     // Fallback: if specific mapping failed, use simple approach
-    // We can't build PCI-based mapping without topology, so just return success
-    // getEfaDevicesForPci() will return all_devices when no mapping is found
-    NIXL_WARN << "Using fallback: all GPUs will use all available EFA devices";
+    gpu_to_nics.clear();
+    // Give all devices to all GPUs (not optimal but functional)
+    for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
+        gpu_to_nics[gpu_id] = all_devices;
+    }
     return NIXL_SUCCESS;
 }
+
 
 // hwloc helper methods
 
@@ -590,6 +760,35 @@ nixlLibfabricTopology::getPcieAddressFromHwlocObj(hwloc_obj_t obj) const {
     return std::string(pcie_addr);
 }
 
+bool
+nixlLibfabricTopology::isIntelHpu(hwloc_obj_t obj) const {
+    if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE) {
+        return false;
+    }
+    // Intel Habana vendor ID is 0x1da3
+    if (obj->attr->pcidev.vendor_id != 0x1da3) {
+        return false;
+    }
+    // Gaudi devices use class 0x1200 (Processing Accelerators)
+    // Accept this class specifically for Habana devices
+    uint16_t class_id = obj->attr->pcidev.class_id;
+    return (class_id == 0x1200);
+}
+
+bool
+nixlLibfabricTopology::isIntelXpu(hwloc_obj_t obj) const {
+    if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE) {
+        return false;
+    }
+
+    if (obj->attr->pcidev.vendor_id != 0x8086) {
+        return false;
+    }
+    // Gaudi devices use class 0x1200 (Processing Accelerators)
+    // Accept this class specifically for Habana devices
+    uint16_t class_id = obj->attr->pcidev.class_id;
+    return (class_id == 0x300);
+}
 bool
 nixlLibfabricTopology::isNvidiaGpu(hwloc_obj_t obj) const {
     if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE) {
@@ -618,6 +817,20 @@ nixlLibfabricTopology::isEfaDevice(hwloc_obj_t obj) const {
         (obj->attr->pcidev.device_id & 0xfff0) == 0xefa0;
 }
 
+bool
+nixlLibfabricTopology::isMellanoxNic(hwloc_obj_t obj) const {
+    if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE) {
+        return false;
+    }
+
+    // Mellanox/NVIDIA vendor ID is 0x15b3
+    // Class 0x0200 is Network controller (Ethernet)
+    // Class 0x0207 is InfiniBand controller
+    uint16_t class_id = obj->attr->pcidev.class_id;
+    return obj->attr->pcidev.vendor_id == 0x15b3 &&
+           (class_id == 0x0200 || class_id == 0x0207);
+}
+
 nixl_status_t
 nixlLibfabricTopology::groupNicsWithGpus(const std::vector<NicInfo> &discovered_nics,
                                          const std::vector<GpuInfo> &discovered_gpus,
@@ -627,8 +840,8 @@ nixlLibfabricTopology::groupNicsWithGpus(const std::vector<NicInfo> &discovered_
     // Implement NIXL's topology-aware NIC grouping algorithm
 
     // Step 1: Mark topology nodes that have NICs in their subtree
-    std::unordered_map<hwloc_obj_t, int> node_group_counts;
-    std::unordered_map<hwloc_obj_t, std::vector<NicInfo>> node_nics;
+    std::map<hwloc_obj_t, int> node_group_counts;
+    std::map<hwloc_obj_t, std::vector<NicInfo>> node_nics;
     std::set<hwloc_obj_t> nic_subtree_nodes;
     // Mark all nodes that have NICs in their subtree and collect NICs per node
     for (const auto &nic : discovered_nics) {
@@ -641,7 +854,7 @@ nixlLibfabricTopology::groupNicsWithGpus(const std::vector<NicInfo> &discovered_
     }
 
     // Step 2: For each GPU, walk up until finding a NIC subtree node and increment its count
-    std::unordered_map<hwloc_obj_t, std::vector<GpuInfo>> node_gpus;
+    std::map<hwloc_obj_t, std::vector<GpuInfo>> node_gpus;
 
     for (const auto &gpu : discovered_gpus) {
         hwloc_obj_t node = gpu.hwloc_node;
@@ -657,7 +870,7 @@ nixlLibfabricTopology::groupNicsWithGpus(const std::vector<NicInfo> &discovered_
     }
 
     // Step 3: Collect all NICs that need to be grouped and assign them to ancestor nodes
-    std::unordered_map<hwloc_obj_t, std::vector<NicInfo>> ancestor_nics;
+    std::map<hwloc_obj_t, std::vector<NicInfo>> ancestor_nics;
 
     for (const auto &pair : node_nics) {
         hwloc_obj_t nic_node = pair.first;
@@ -701,8 +914,8 @@ nixlLibfabricTopology::groupNicsWithGpus(const std::vector<NicInfo> &discovered_
             });
 
             // Split NICs among GPUs
-            const int nics_per_group = nics.size() / num_groups;
-            const int extra_nics = nics.size() % num_groups;
+            int nics_per_group = nics.size() / num_groups;
+            int extra_nics = nics.size() % num_groups;
 
             size_t nic_idx = 0;
             for (int group_idx = 0; group_idx < num_groups && group_idx < (int)gpus.size();
@@ -711,20 +924,11 @@ nixlLibfabricTopology::groupNicsWithGpus(const std::vector<NicInfo> &discovered_
                 group.has_gpu = true;
                 group.closest_gpu = gpus[group_idx];
                 group.common_ancestor = ancestor;
-
-                if (nics.size() < (size_t)num_groups) {
-                    // Give all NICs to this GPU
-                    NIXL_DEBUG << "Fewer NICs (" << nics.size() << ") than GPUs (" << num_groups
-                               << ") at ancestor - sharing all NICs with each GPU";
-                    group.nics = nics;
-                } else {
-                    // Assign NICs to this group via partitioning
-                    int group_size = nics_per_group + (group_idx < extra_nics ? 1 : 0);
-                    for (int i = 0; i < group_size && nic_idx < nics.size(); ++i, ++nic_idx) {
-                        group.nics.push_back(nics[nic_idx]);
-                    }
+                // Assign NICs to this group
+                int group_size = nics_per_group + (group_idx < extra_nics ? 1 : 0);
+                for (int i = 0; i < group_size && nic_idx < nics.size(); ++i, ++nic_idx) {
+                    group.nics.push_back(nics[nic_idx]);
                 }
-
                 if (!group.nics.empty()) {
                     nic_groups.push_back(group);
                 }
