@@ -690,8 +690,8 @@ nixlLibfabricEngine::establishConnection(const std::string &remote_agent) const 
     memcpy(control_request->buffer, serialized_conn_info.data(), serialized_conn_info.length());
     control_request->buffer_size = serialized_conn_info.length();
 
-    NIXL_INFO << "Posting CONNECTION_REQ to control_rail_remote_addr: "
-              << conn_info->control_rail_remote_addr_list_[0]
+    NIXL_INFO << "Posting CONNECTION_REQ to control_rail_remote_addr[0][0]: "
+              << conn_info->control_rail_remote_addr_list_[0][0]
               << " agent_index: " << it->second->agent_index_;
 
     nixl_status_t status = rail_manager.postControlMessage(

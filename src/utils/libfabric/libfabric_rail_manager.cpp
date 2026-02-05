@@ -199,10 +199,13 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
 
     if (!use_striping) {
         // Round-robin: use one rail for entire transfer
-        size_t rail_idx = round_robin_counter.fetch_add(1) % selected_rails.size();
-        size_t rail_id = selected_rails[rail_idx];
+        const auto counter_value = round_robin_counter.fetch_add(1);
+        const size_t rail_id = selected_rails[counter_value % selected_rails.size()];
+        const size_t remote_ep_id =
+            remote_selected_endpoints[counter_value % remote_selected_endpoints.size()];
 
-        NIXL_DEBUG << "Non-striping path: rail_idx=" << rail_idx << " rail_id=" << rail_id;
+        NIXL_DEBUG << "Non-striping path: rail_idx=" << rail_idx << " rail_id=" << rail_id
+                   << " remote_ep_id=" << remote_ep_id;
 
         // Ensure rail is marked active for progress thread to process completions
         markRailActive(rail_id);
@@ -279,7 +282,9 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
         size_t remainder = transfer_size % num_rails;
         for (size_t i = 0; i < num_rails; ++i) {
             size_t rail_id = selected_rails[i];
-            NIXL_TRACE << "Striping: using rail_id=" << rail_id << " for chunk " << i;
+            size_t remote_ep_id = i % remote_selected_endpoints.size();
+            NIXL_TRACE << "Striping: using rail_id=" << rail_id << " for chunk " << i
+                       << " remote_ep_id=" << remote_ep_id;
             size_t current_chunk_size = chunk_size + (i == num_rails - 1 ? remainder : 0);
             if (current_chunk_size == 0) break;
 
