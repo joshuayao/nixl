@@ -203,9 +203,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
         const size_t rail_id = selected_rails[counter_value % selected_rails.size()];
         const size_t remote_ep_id =
             remote_selected_endpoints[counter_value % remote_selected_endpoints.size()];
-
-        NIXL_DEBUG << "Non-striping path: rail_idx=" << rail_idx << " rail_id=" << rail_id
-                   << " remote_ep_id=" << remote_ep_id;
+        NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id " << remote_ep_id;
 
         // Ensure rail is marked active for progress thread to process completions
         markRailActive(rail_id);
