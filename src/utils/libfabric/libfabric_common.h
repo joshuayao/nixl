@@ -31,10 +31,12 @@
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_rma.h>
+#include <rdma/fi_ext.h>
 
 // Libfabric configuration constants
 #define NIXL_LIBFABRIC_DEFAULT_CONTROL_RAILS 1
-#define NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_SEC 1
+// fi_cq_sread timeout is in milliseconds, not seconds
+#define NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_MS 1000
 #define NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD (128 * 1024) // 128KB
 #define LF_EP_NAME_MAX_LEN 56
 
@@ -42,6 +44,7 @@
 #define NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL 1024 // SEND/RECV operations (1:1 with buffers)
 #define NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL 1024 // WRITE/read operations (no buffers)
 #define NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE 8192
+#define NIXL_LIBFABRIC_INITIAL_RECV_COUNT 16 // Number of initial receive buffers to post
 
 // Retry configuration constants
 #define NIXL_LIBFABRIC_MAX_RETRIES 10
@@ -142,6 +145,16 @@ struct BinaryNotification {
     }
 };
 
+// Provider configuration structure
+struct ProviderConfig {
+    std::string name;
+    uint64_t caps;
+    uint64_t mode;
+    uint64_t mr_mode;
+    fi_resource_mgmt resource_mgmt;
+    fi_threading threading;
+};
+
 // Global XFER_ID management
 namespace LibfabricUtils {
 // Get next unique XFER_ID
@@ -163,6 +176,9 @@ getAvailableNetworkDevices();
 // String utilities
 std::string
 hexdump(const void *data);
+// Provider configuration helper
+void
+configureHintsForProvider(struct fi_info* hints, const std::string& provider_name);
 } // namespace LibfabricUtils
 
 #endif // NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_COMMON_H

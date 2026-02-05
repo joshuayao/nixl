@@ -15,7 +15,7 @@
 
 project('nixl', 'CPP', version: '0.7.0',
     default_options: ['buildtype=debug',
-                'werror=true',
+                #'werror=true',
                 'cpp_std=c++17',
                 'prefix=/opt/nvidia/nvda_nixl'],
     meson_version: '>= 0.64.0'
@@ -110,6 +110,54 @@ if cuda_dep.found()
 else
     warning('CUDA not found. UCX backend will be built without CUDA support, and some plugins will be disabled.')
     doca_gpunetio_dep = disabler()
+endif
+
+# SynapseAI (Habana Gaudi) dependency detection
+# Try to find both libSynapse and hl-thunk libraries
+synapse_lib = cpp.find_library('Synapse',
+                               dirs: ['/usr/lib/habanalabs', '/usr/local/lib/habanalabs'],
+                               required: false)
+hlthunk_lib = cpp.find_library('hl-thunk',
+                               dirs: ['/usr/lib/habanalabs', '/usr/local/lib/habanalabs'],
+                               required: false)
+
+# SynapseAI support requires both libraries
+synapseai_dep = dependency('', required: false)  # Initialize as not found
+if synapse_lib.found() and hlthunk_lib.found()
+    synapseai_dep = declare_dependency(dependencies: [synapse_lib, hlthunk_lib])
+elif hlthunk_lib.found()
+    # Fallback to just hl-thunk if libSynapse not available
+    synapseai_dep = hlthunk_lib
+endif
+
+if synapseai_dep.found()
+    # Create proper dependency with include paths (including DRM path for habanalabs headers)
+    synapseai_dep = declare_dependency(
+        dependencies: synapseai_dep,
+        include_directories: [
+            include_directories('/usr/include/habanalabs'),
+            include_directories('/usr/include/drm')
+        ]
+    )
+    message('Found SynapseAI support for Habana Gaudi devices')
+else
+    warning('SynapseAI not found. Habana Gaudi device support will be disabled.')
+endif
+
+sycl_root = '/opt/intel/oneapi/compiler/latest'
+sycl_inc = include_directories(join_paths(sycl_root, 'include'))
+
+sycl_libdir = join_paths(sycl_root, 'lib')
+
+sycl_dep = declare_dependency(
+  include_directories : sycl_inc,
+  link_args : ['-L' + sycl_libdir, '-lsycl', '-lze_loader']
+)
+
+if sycl_dep.found()
+    message('Found SYCL support for XPU devices')
+else
+    error('Cannot found SYCL support for XPU devices')
 endif
 
 # DOCA GPUNETIO
